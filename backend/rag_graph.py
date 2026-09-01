@@ -1,0 +1,199 @@
+import os
+from pathlib import Path
+from typing import TypedDict, Annotated
+
+from dotenv import load_dotenv
+from langgraph.graph.message import add_messages
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_groq import ChatGroq
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+
+load_dotenv()
+
+if not os.getenv("GROQ_API_KEY"):
+    raise RuntimeError(
+        "GROQ_API_KEY is not set. Add it to a .env file in the backend folder, "
+        "e.g.\n\nGROQ_API_KEY=your_key_here\n"
+    )
+
+BASE_DIR = Path(__file__).resolve().parent
+
+ACADEMIC_PDF = BASE_DIR / "GGITS_Complete_Academic_Information_2026.pdf"
+FEE_PDF = BASE_DIR / "GGITS_Fee_Structure_and_Scholarships_2026.pdf"
+
+PROGRAMME_MAP = {
+    "1": "Btech",
+    "2": "mtech",
+    "3": "B.Com(H)",
+    "4": "BBA",
+    "5": "MBA",
+    "6": "MCA",
+    "7": "BCA",
+}
+
+# ---------------------------------------------------------------------------
+# Step 1 - Retrievers (built once, at import time, and reused for every request)
+# ---------------------------------------------------------------------------
+
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+
+def build_retriever(pdf_path: Path):
+    if not pdf_path.exists():
+        raise FileNotFoundError(
+            f"Expected PDF not found: {pdf_path}\n"
+            f"Place it inside the backend folder next to rag_graph.py."
+        )
+    loader = PyPDFLoader(str(pdf_path))
+    document = loader.load()
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    chunks = splitter.split_documents(document)
+
+    vectorstore = FAISS.from_documents(chunks, embeddings)
+    return vectorstore.as_retriever(search_kwargs={"k": 4})
+
+
+academic_retriever = build_retriever(ACADEMIC_PDF)
+fee_retriever = build_retriever(FEE_PDF)
+
+llm = ChatGroq(
+    model="openai/gpt-oss-20b",
+    temperature=0.4,
+)
+
+
+# ---------------------------------------------------------------------------
+# Step 2 - State
+# ---------------------------------------------------------------------------
+
+class State(TypedDict):
+    programme: str
+    message: Annotated[list, add_messages]
+    query_type: str
+    retrieved_context: str
+
+
+# ---------------------------------------------------------------------------
+# Step 3 - Nodes
+# ---------------------------------------------------------------------------
+
+def classifier_node(state: State) -> dict:
+    """Look at the latest user message and decide which path to take."""
+    last_message = state["message"][-1].content
+    prompt = (
+        "Classify the following student query into exactly one category: "
+        "'academic', 'fee', or 'general'.\n\n"
+        "Use 'academic' for questions about attendance, exams, grading, credits, "
+        "promotion, course structure, summer training, or degree requirements.\n"
+        "Use 'fee' for questions about tuition, payment, refund, late charges, "
+        "scholarships, or any money-related topic.\n"
+        "Use 'general' for greetings, casual talk, or anything not related to "
+        "the college rules or fee.\n\n"
+        f"Query: {last_message}\n\n"
+        "Return only one word: academic, fee, or general."
+    )
+
+    response = llm.invoke(prompt)
+    category = response.content.strip().lower()
+
+    if "academic" in category:
+        category = "academic"
+    elif "fee" in category:
+        category = "fee"
+    else:
+        category = "general"
+
+    return {"query_type": category}
+
+
+def academic_rag_node(state: State) -> dict:
+    """Retrieve relevant chunks from the academic handbook."""
+    query = state["message"][-1].content
+    docs = academic_retriever.invoke(query)
+    context = "\n\n".join(doc.page_content for doc in docs)
+    return {"retrieved_context": context}
+
+
+def fee_rag_node(state: State) -> dict:
+    """Retrieve relevant chunks from the fee structure PDF."""
+    query = state["message"][-1].content
+    docs = fee_retriever.invoke(query)
+    context = "\n\n".join(doc.page_content for doc in docs)
+    return {"retrieved_context": context}
+
+
+def general_node(state: State) -> dict:
+    """Answer directly using the LLM's own knowledge, no retrieval needed."""
+    return {"retrieved_context": "NO_RETRIEVAL_NEEDED"}
+
+
+def response_node(state: State) -> dict:
+    """Generate the final answer, personalized using the student's programme."""
+    query = state["message"][-1].content
+    programme = state.get("programme", "Unknown")
+    context = state["retrieved_context"]
+
+    if context == "NO_RETRIEVAL_NEEDED":
+        prompt = (
+            f"You are a friendly college assistant talking to a {programme} student. "
+            f"Answer this question using your own general knowledge:\n\n{query}"
+        )
+    else:
+        prompt = (
+            f"You are a college assistant helping a {programme} student. "
+            f"Use the following context from the official college documents to answer "
+            f"the question accurately. If the context mentions specific figures for "
+            f"different programmes, highlight the one relevant to {programme} if possible.\n\n"
+            f"Context:\n{context}\n\n"
+            f"Question: {query}\n\n"
+            f"Give a clear, friendly, and precise answer."
+        )
+
+    response = llm.invoke(prompt)
+    return {"message": [("ai", response.content.strip())]}
+
+
+# ---------------------------------------------------------------------------
+# Step 4 - Router
+# ---------------------------------------------------------------------------
+
+def route_query(state: State):
+    if state["query_type"] == "academic":
+        return "academic_rag"
+    elif state["query_type"] == "fee":
+        return "fee_rag"
+    else:
+        return "general"
+
+
+# ---------------------------------------------------------------------------
+# Step 5 - Build + compile the graph (with memory, so sessions persist)
+# ---------------------------------------------------------------------------
+
+def build_app():
+    graph = StateGraph(State)
+
+    graph.add_node("classifier", classifier_node)
+    graph.add_node("academic_rag", academic_rag_node)
+    graph.add_node("fee_rag", fee_rag_node)
+    graph.add_node("general", general_node)
+    graph.add_node("response", response_node)
+
+    graph.add_edge(START, "classifier")
+    graph.add_conditional_edges("classifier", route_query)
+    graph.add_edge("academic_rag", "response")
+    graph.add_edge("fee_rag", "response")
+    graph.add_edge("general", "response")
+    graph.add_edge("response", END)
+
+    checkpointer = MemorySaver()
+    return graph.compile(checkpointer=checkpointer)
+
+
+# Built once at import time and reused across all requests.
+compiled_app = build_app()
