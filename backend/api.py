@@ -56,7 +56,7 @@ class ChatResponse(BaseModel):
 # Chat API
 # -----------------------------------
 
-@api.post("/api/chat", response_model=ChatResponse)
+@app.post("/api/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
 
     try:
@@ -110,7 +110,7 @@ def chat(request: ChatRequest):
 # Health Check API
 # -----------------------------------
 
-@api.get("/")
+@app.get("/")
 def home():
 
     return {
@@ -118,7 +118,7 @@ def home():
     }
 
 
-@api.get("/health")
+@app.get("/health")
 def health():
 
     return {
