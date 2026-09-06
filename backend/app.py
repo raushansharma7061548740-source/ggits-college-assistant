@@ -12,7 +12,7 @@ from main import app as langgraph_app
 # Create FastAPI application
 # -----------------------------------
 
-api = FastAPI(
+app = FastAPI(
     title="GGITS Assistant API",
     description="College Assistant powered by LangGraph and RAG",
     version="1.0.0"
