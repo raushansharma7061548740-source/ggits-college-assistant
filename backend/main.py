@@ -224,4 +224,12 @@ graph.add_edge("general","response")
 
 graph.add_edge("response",END)
 
-app = graph.compile()
+from langgraph.checkpoint.memory import MemorySaver
+
+
+
+memory = MemorySaver()
+
+app = graph.compile(
+    checkpointer=memory
+)

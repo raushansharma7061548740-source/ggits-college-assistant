@@ -61,23 +61,34 @@ def chat(request: ChatRequest):
 
     try:
 
-        # Create session ID if frontend doesn't have one
+        # Get existing session ID
         session_id = request.session_id
 
+
+        # Create new session ID if needed
         if not session_id:
+
             session_id = str(uuid4())
 
 
-        # Invoke your LangGraph
-        result = langgraph_app.invoke({
+        # Invoke LangGraph with conversation memory
+        result = langgraph_app.invoke(
 
-            "programme": request.programme,
+            {
+                "programme": request.programme,
 
-            "message": [
-                ("human", request.message)
-            ]
+                "message": [
+                    ("human", request.message)
+                ]
+            },
 
-        })
+            config={
+                "configurable": {
+                    "thread_id": session_id
+                }
+            }
+
+        )
 
 
         # Get final AI response
@@ -85,14 +96,20 @@ def chat(request: ChatRequest):
 
 
         # Get classifier category
-        category = result.get("query_type", "general")
+        category = result.get(
+            "query_type",
+            "general"
+        )
 
 
-        # Return data to frontend
         return ChatResponse(
+
             reply=reply,
+
             category=category,
+
             session_id=session_id
+
         )
 
 
@@ -104,8 +121,6 @@ def chat(request: ChatRequest):
             status_code=500,
             detail=str(e)
         )
-
-
 # -----------------------------------
 # Health Check API
 # -----------------------------------
